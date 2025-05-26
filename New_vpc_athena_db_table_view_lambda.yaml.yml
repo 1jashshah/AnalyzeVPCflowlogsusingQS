@@ -1,0 +1,547 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template creates Athena Database and View for VPC Flow Logs'
+Parameters:
+  AthenaQueryResultBucketArn:
+    Type: String
+    Description: The ARN of the Amazon S3 bucket where Athena query results are stored (e.g., 'arn:aws:s3:::aws-athena-query-results-us-east-1-XXXXXXXXXXXXXX').
+  AthenaResultsOutputLocation:
+    Type: String
+    Description: URI path of the Amazon S3 bucket where Athena query results are stored (e.g., 's3://aws-athena-query-results-us-east-1-XXXXXXXXXXXXXX/').
+  VpcFlowLogsBucketName:
+    Type: String
+    Description: Name of the Amazon S3 bucket where VPC Flow Logs are stored (e.g., 'my-flow-logs').
+  VpcFlowLogsS3BucketLocation:
+    Type: String
+    Description: URI path of the Amazon S3 bucket folder where VPC Flow Logs are stored (e.g., 's3://my-vpc-flow-logs-bucket/vpc-flow-logs-enh-parquet/AWSLogs/0123456789/vpcflowlogs/eu-central-1/').
+  VpcFlowLogsFilePrefix:
+    Type: String
+    Description: (Optional) The log file prefix in the S3 bucket that comes after the bucket name (e.g., 'vpc-flow-logs/'). Include trailing slash.
+    Default: ''
+  VpcFlowLogsAthenaDatabaseName:
+    Type: String
+    Description: (Optional) Name of an existing Athena database. If blank, a new database named 'vpcflowlogsathenadatabase' will be created.
+    Default: ''
+  VpcFlowLogsAthenaTableName:
+    Type: String
+    Description: (Optional) Name of an existing Athena table. If blank, a new table named 'vpc_flow_logs_custom_integration' will be created.
+    Default: ''
+  HiveCompatibleS3prefix:
+    Type: String
+    Description: Whether to use Hive-compatible S3 prefixes (e.g., 'aws-service=vpcflowlogs/').
+    AllowedValues: [true, false]
+    Default: false
+  S3BucketRegion:
+    Type: String
+    Description: Region of the S3 bucket (e.g., 'us-east-1').
+
+Conditions:
+  VpcLogsAthenaDataBaseCondition: !Equals [!Ref VpcFlowLogsAthenaDatabaseName, '']
+  ExistingVpcLogsAthenaDataBaseCondition: !Not [!Equals [!Ref VpcFlowLogsAthenaDatabaseName, '']]
+  VpcLogsAthenaTableCondition: !Equals [!Ref VpcFlowLogsAthenaTableName, '']
+  ExistingVpcLogsAthenaTableCondition: !Not [!Equals [!Ref VpcFlowLogsAthenaTableName, '']]
+
+Resources:
+  VpcFlowLogsAthenaDatabase:
+    Condition: VpcLogsAthenaDataBaseCondition
+    Type: AWS::Glue::Database
+    Properties:
+      DatabaseInput:
+        Name: vpcflowlogsathenadatabase
+      CatalogId: !Ref AWS::AccountId
+
+  VpcFlowLogsAthenaTable:
+    Condition: VpcLogsAthenaTableCondition
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !If [ExistingVpcLogsAthenaDataBaseCondition, !Ref VpcFlowLogsAthenaDatabaseName, vpcflowlogsathenadatabase]
+      TableInput:
+        Description: Table for VPC Flow Logs data.
+        Name: vpc_flow_logs_custom_integration
+        PartitionKeys:
+          - Name: aws-account-id
+            Type: string
+          - Name: aws-service
+            Type: string
+          - Name: aws-region
+            Type: string
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+        TableType: EXTERNAL_TABLE
+        StorageDescriptor:
+          Location: !Ref VpcFlowLogsS3BucketLocation
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Parameters:
+              skip.header.line.count: "1"
+              EXTERNAL: "true"
+              field.delim: ' '
+              serialization.format: ' '
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+          Columns:
+            - Name: version
+              Type: int
+            - Name: account_id
+              Type: string
+            - Name: interface_id
+              Type: string
+            - Name: srcaddr
+              Type: string
+            - Name: dstaddr
+              Type: string
+            - Name: srcport
+              Type: int
+            - Name: dstport
+              Type: int
+            - Name: protocol
+              Type: bigint
+            - Name: packets
+              Type: bigint
+            - Name: bytes
+              Type: bigint
+            - Name: start
+              Type: bigint
+            - Name: end
+              Type: bigint
+            - Name: action
+              Type: string
+            - Name: log_status
+              Type: string
+            - Name: vpc_id
+              Type: string
+            - Name: az_id
+              Type: string
+            - Name: instance_id
+              Type: string
+            - Name: pkt_srcaddr
+              Type: string
+            - Name: pkt_dstaddr
+              Type: string
+            - Name: region
+              Type: string
+            - Name: subnet_id
+              Type: string
+            - Name: sublocation_id
+              Type: string
+            - Name: sublocation_type
+              Type: string
+            - Name: tcp_flags
+              Type: int
+            - Name: type
+              Type: string
+            - Name: flow_direction
+              Type: string
+            - Name: pkt_dst_aws_service
+              Type: string
+            - Name: pkt_src_aws_service
+              Type: string
+            - Name: traffic_path
+              Type: int
+
+  VPCFlowLogsAthenaIntegrationLambdaExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: VPCFlowLogsAthenaIntegrationLambdaExecutorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Ref AthenaQueryResultBucketArn
+                  - !Sub 'arn:aws:s3:::${VpcFlowLogsBucketName}'
+                  - !Sub 'arn:aws:logs:${S3BucketRegion}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Ref AthenaQueryResultBucketArn
+                  - !Sub '${AthenaQueryResultBucketArn}/*'
+                  - !Sub 'arn:aws:logs:${S3BucketRegion}:${AWS::AccountId}:log-group:/aws/lambda/vpc_logs_lambda_handler:*'
+              - Effect: Allow
+                Action:
+                  - athena:GetQueryResults
+                  - athena:StartQueryExecution
+                  - athena:CreateNamedQuery
+                  - athena:GetQueryExecution
+                Resource:
+                  - !Sub 'arn:aws:athena:${S3BucketRegion}:${AWS::AccountId}:workgroup/primary'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:BatchCreatePartition
+                  - glue:CreatePartition
+                  - glue:UpdatePartition
+                  - glue:GetPartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${S3BucketRegion}:${AWS::AccountId}:catalog'
+                  - !If [ExistingVpcLogsAthenaDataBaseCondition, !Sub 'arn:aws:glue:${S3BucketRegion}:${AWS::AccountId}:database/${VpcFlowLogsAthenaDatabaseName}', !Sub 'arn:aws:glue:${S3BucketRegion}:${AWS::AccountId}:database/vpcflowlogsathenadatabase']
+                  - !If [ExistingVpcLogsAthenaTableCondition, !Sub 'arn:aws:glue:${S3BucketRegion}:${AWS::AccountId}:table/${VpcFlowLogsAthenaDatabaseName}/${VpcFlowLogsAthenaTableName}', !Sub 'arn:aws:glue:${S3BucketRegion}:${AWS::AccountId}:table/vpcflowlogsathenadatabase/vpc_flow_logs_custom_integration']
+                  - !Sub 'arn:aws:glue:${S3BucketRegion}:${AWS::AccountId}:table/*/vpc_flow_logs_view'
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectTagging
+                  - s3:GetBucketPolicy
+                Resource:
+                  - !Sub 'arn:aws:s3:::${VpcFlowLogsBucketName}'
+                  - !Sub 'arn:aws:s3:::${VpcFlowLogsBucketName}/*'
+      Tags:
+        - Key: Name
+          Value: VPCFlowLogs-Lambda-Role
+        - Key: Purpose
+          Value: WALabVPCFlowLogs
+
+  VPCAthenaPartitionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Adds partitions to Athena table for VPC Flow Logs. Triggered daily by CloudWatch.
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt VPCFlowLogsAthenaIntegrationLambdaExecutorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import time
+          import re
+          import cfnresponse
+          import logging
+
+          # Configure logging
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger()
+
+          # S3 and Athena clients
+          s3 = boto3.client('s3')
+          athena = boto3.client('athena')
+
+          # Get current date for partitioning
+          date = datetime.datetime.utcnow()
+          athena_year = str(date.year)
+          athena_month = str(date.month).zfill(2)
+          athena_day = str(date.day).zfill(2)
+
+          def run_query(query, database, s3_output):
+              logger.info(f"Executing query: {query}")
+              try:
+                  query_response = athena.start_query_execution(
+                      QueryString=query,
+                      QueryExecutionContext={'Database': database},
+                      ResultConfiguration={'OutputLocation': s3_output}
+                  )
+                  execution_id = query_response['QueryExecutionId']
+                  state = 'RUNNING'
+                  max_attempts = 30
+                  attempt = 0
+                  while state in ['RUNNING', 'QUEUED'] and attempt < max_attempts:
+                      response = athena.get_query_execution(QueryExecutionId=execution_id)
+                      if 'QueryExecution' in response and 'Status' in response['QueryExecution']:
+                          state = response['QueryExecution']['Status']['State']
+                          if state == 'FAILED':
+                              logger.error(f"Query failed: {response}")
+                              return False
+                          elif state == 'SUCCEEDED':
+                              s3_path = response['QueryExecution']['ResultConfiguration']['OutputLocation']
+                              logger.info(f"Query succeeded, output: {s3_path}")
+                              return response
+                      time.sleep(2)
+                      attempt += 1
+                  logger.error(f"Query timed out after {max_attempts} attempts")
+                  return False
+              except Exception as e:
+                  logger.error(f"Query exception: {str(e)}")
+                  return False
+
+          def lambda_handler(event, context):
+              logger.info(f"Event received: {event}")
+              status = cfnresponse.SUCCESS
+              try:
+                  database = event.get("ResourceProperties", {}).get("dbName", "vpcflowlogsathenadatabase")
+                  table_name = event.get("ResourceProperties", {}).get("VPCTableName", "vpc_flow_logs_custom_integration")
+                  s3_bucket_flow_log = event.get("ResourceProperties", {}).get("VpcFlowLogsBucketName", "")
+                  s3_output = event.get("ResourceProperties", {}).get("s3Output", "")
+                  s3_prefix = event.get("ResourceProperties", {}).get("VpcFlowLogsFilePrefix", "") + "AWSLogs/"
+                  hive_compatible = event.get("ResourceProperties", {}).get("HiveCompatibleS3prefix", "false") == "true"
+                  frequency = event.get("ResourceProperties", {}).get("frequency", "Daily")
+
+                  if not all([s3_bucket_flow_log, s3_output, database, table_name]):
+                      logger.error("Missing required parameters")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": "Missing required parameters"})
+                      return
+
+                  if event.get("RequestType") == 'Delete':
+                      logger.info("Delete request received, exiting")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  # List accounts in S3
+                  account_result = s3.list_objects_v2(Bucket=s3_bucket_flow_log, Prefix=s3_prefix, Delimiter='/')
+                  if 'CommonPrefixes' not in account_result:
+                      logger.warning(f"No accounts found in S3 prefix: {s3_prefix}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  for account in account_result.get('CommonPrefixes', []):
+                      account_prefix = account.get('Prefix', '').replace(s3_prefix, '').rstrip('/')
+                      account_id = account_prefix.split('=')[-1] if '=' in account_prefix else account_prefix
+                      logger.info(f"Processing account: {account_id}")
+
+                      region_prefix = s3_prefix + account_prefix + ('/aws-service=vpcflowlogs/' if hive_compatible else '/vpcflowlogs/')
+                      s3_input = f's3://{s3_bucket_flow_log}/{region_prefix}'
+                      region_result = s3.list_objects_v2(Bucket=s3_bucket_flow_log, Prefix=region_prefix, Delimiter='/')
+
+                      for region in region_result.get('CommonPrefixes', []):
+                          region_name = region.get('Prefix', '').replace(region_prefix, '').rstrip('/').split('=')[-1]
+                          logger.info(f"Processing region: {region_name}")
+
+                          if hive_compatible:
+                              query = f"""ALTER TABLE {database}.{table_name}
+                                        ADD PARTITION (`aws-account-id`="{account_id}", `aws-service`="vpcflowlogs", `aws-region`="{region_name}", `year`="{athena_year}", `month`="{athena_month}", `day`="{athena_day}")
+                                        LOCATION '{s3_input}{region_name}/year={athena_year}/month={athena_month}/day={athena_day}';"""
+                          else:
+                              query = f"""ALTER TABLE {database}.{table_name}
+                                        ADD PARTITION (`aws-account-id`="{account_id}", `aws-service`="vpcflowlogs", `aws-region`="{region_name}", `year`="{athena_year}", `month`="{athena_month}", `day`="{athena_day}")
+                                        LOCATION '{s3_input}{region_name}/{athena_year}/{athena_month}/{athena_day}';"""
+                          query_result = run_query(query, database, s3_output)
+                          if not query_result:
+                              logger.error(f"Failed to add partition for account {account_id}, region {region_name}")
+                              status = cfnresponse.FAILED
+              except Exception as e:
+                  logger.error(f"Exception in lambda_handler: {str(e)}")
+                  status = cfnresponse.FAILED
+              finally:
+                  cfnresponse.send(event, context, status, {})
+      Tags:
+        - Key: Name
+          Value: VPCFlowLogs-Lambda-Function
+        - Key: Purpose
+          Value: WALabVPCFlowLogs
+
+  DailyAddPartitionLambdaEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers Lambda to add partitions daily for VPC Flow Logs.
+      Name: daily-add-vpc-logs-partitions
+      ScheduleExpression: "rate(1 day)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt VPCAthenaPartitionsFunction.Arn
+          Id: DailyAddPartitionLambdaEventsRule
+          Input: !If [
+            ExistingVpcLogsAthenaDataBaseCondition,
+            !Sub '{"frequency": "Daily", "dbName": "${VpcFlowLogsAthenaDatabaseName}", "VPCTableName": "${VpcFlowLogsAthenaTableName}", "s3Output": "${AthenaResultsOutputLocation}", "VpcFlowLogsBucketName": "${VpcFlowLogsBucketName}", "VpcFlowLogsFilePrefix": "${VpcFlowLogsFilePrefix}", "HiveCompatibleS3prefix": "${HiveCompatibleS3prefix}"}',
+            !Sub '{"frequency": "Daily", "dbName": "vpcflowlogsathenadatabase", "VPCTableName": "vpc_flow_logs_custom_integration", "s3Output": "${AthenaResultsOutputLocation}", "VpcFlowLogsBucketName": "${VpcFlowLogsBucketName}", "VpcFlowLogsFilePrefix": "${VpcFlowLogsFilePrefix}", "HiveCompatibleS3prefix": "${HiveCompatibleS3prefix}"}'
+          ]
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt VPCAthenaPartitionsFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyAddPartitionLambdaEventsRule.Arn
+
+  CreatePartitionInitializer:
+    Type: Custom::VPCFlowLogsAthenaPartitionInitializer
+    DependsOn:
+      - VPCAthenaPartitionsFunction
+    Properties:
+      ServiceToken: !GetAtt VPCAthenaPartitionsFunction.Arn
+      dbName: !If [ExistingVpcLogsAthenaDataBaseCondition, !Ref VpcFlowLogsAthenaDatabaseName, vpcflowlogsathenadatabase]
+      VPCTableName: !If [ExistingVpcLogsAthenaTableCondition, !Ref VpcFlowLogsAthenaTableName, vpc_flow_logs_custom_integration]
+      service: vpcflowlogs
+      frequency: Daily
+      s3Output: !Ref AthenaResultsOutputLocation
+      VpcFlowLogsBucketName: !Ref VpcFlowLogsBucketName
+      VpcFlowLogsFilePrefix: !Ref VpcFlowLogsFilePrefix
+      HiveCompatibleS3prefix: !Ref HiveCompatibleS3prefix
+
+  VPCAthenaViewFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Creates Athena view for VPC Flow Logs.
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt VPCFlowLogsAthenaIntegrationLambdaExecutorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          import re
+          import cfnresponse
+          import logging
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger()
+
+          s3 = boto3.client('s3')
+          athena = boto3.client('athena')
+
+          def run_query(query, database, s3_output):
+              logger.info(f"Executing query: {query}")
+              try:
+                  query_response = athena.start_query_execution(
+                      QueryString=query,
+                      QueryExecutionContext={'Database': database},
+                      ResultConfiguration={'OutputLocation': s3_output}
+                  )
+                  execution_id = query_response['QueryExecutionId']
+                  state = 'RUNNING'
+                  max_attempts = 30
+                  attempt = 0
+                  while state in ['RUNNING', 'QUEUED'] and attempt < max_attempts:
+                      response = athena.get_query_execution(QueryExecutionId=execution_id)
+                      if 'QueryExecution' in response and 'Status' in response['QueryExecution']:
+                          state = response['QueryExecution']['Status']['State']
+                          if state == 'FAILED':
+                              logger.error(f"Query failed: {response}")
+                              return False
+                          elif state == 'SUCCEEDED':
+                              s3_path = response['QueryExecution']['ResultConfiguration']['OutputLocation']
+                              logger.info(f"Query succeeded, output: {s3_path}")
+                              return True
+                      time.sleep(2)
+                      attempt += 1
+                  logger.error(f"Query timed out after {max_attempts} attempts")
+                  return False
+              except Exception as e:
+                  logger.error(f"Query exception: {str(e)}")
+                  return False
+
+          def lambda_handler(event, context):
+              logger.info(f"Event received: {event}")
+              status = cfnresponse.SUCCESS
+              try:
+                  database = event["ResourceProperties"]["athenaIntegrations"][0]["database"]
+                  s3_output = event["ResourceProperties"]["athenaIntegrations"][0]["s3_output"]
+                  vpc_table_name = event["ResourceProperties"]["athenaIntegrations"][0]["vpc_table_name"]
+
+                  if event.get("RequestType") == 'Delete':
+                      logger.info("Delete request received, exiting")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  query = f"""
+                      CREATE OR REPLACE VIEW vpc_flow_logs_view AS
+                      SELECT
+                          version,
+                          account_id AS accountid,
+                          interface_id AS interfaceid,
+                          srcaddr AS sourceaddress,
+                          dstaddr AS destinationaddress,
+                          srcport AS sourceport,
+                          dstport AS destinationport,
+                          protocol,
+                          packets AS numpackets,
+                          bytes AS numbytes,
+                          start AS starttime,
+                          end AS endtime,
+                          action,
+                          log_status AS logstatus,
+                          vpc_id AS vpcid,
+                          az_id AS azid,
+                          instance_id AS instanceid,
+                          pkt_srcaddr AS packetsourceaddr,
+                          pkt_dstaddr AS packetdestinationaddr,
+                          region,
+                          subnet_id AS subnetid,
+                          sublocation_id AS sublocationid,
+                          sublocation_type AS sublocationtype,
+                          CASE
+                              WHEN tcp_flags = 1 THEN 'FIN'
+                              WHEN tcp_flags = 2 THEN 'SYN'
+                              WHEN tcp_flags = 3 THEN 'SYN-FIN'
+                              WHEN tcp_flags = 4 THEN 'RST'
+                              WHEN tcp_flags = 8 THEN 'PSH'
+                              WHEN tcp_flags = 16 THEN 'ACK'
+                              WHEN tcp_flags = 18 THEN 'SYN-ACK'
+                              WHEN tcp_flags = 19 THEN 'SYN-ACK-FIN'
+                              WHEN tcp_flags = 32 THEN 'URG'
+                              ELSE CAST(tcp_flags AS VARCHAR)
+                          END AS tcpflags,
+                          tcp_flags,
+                          flow_direction AS flowdirection,
+                          pkt_src_aws_service AS packetsrcawsservice,
+                          pkt_dst_aws_service AS packetdstawsservice,
+                          CASE
+                              WHEN traffic_path = 1 THEN 'ResourceInSameVPC'
+                              WHEN traffic_path = 2 THEN 'IGW-OR-GatewayVPCEndpoint'
+                              WHEN traffic_path = 3 THEN 'VirtualPrivateGateway'
+                              WHEN traffic_path = 4 THEN 'Intra-RegionVPCPeering'
+                              WHEN traffic_path = 5 THEN 'Inter-RegionVPCPeering'
+                              WHEN traffic_path = 6 THEN 'LocalGateway'
+                              WHEN traffic_path = 7 THEN 'GatewayVPCEndpoint'
+                              WHEN traffic_path = 8 THEN 'InternetGateway'
+                              ELSE CAST(traffic_path AS VARCHAR)
+                          END AS trafficpath,
+                          traffic_path,
+                          type AS iptype,
+                          CAST(DATE_FORMAT(FROM_UNIXTIME(start), '%d') AS INTEGER) AS startday,
+                          CAST(DATE_FORMAT(FROM_UNIXTIME(start), '%m') AS INTEGER) AS startmonth,
+                          CAST(DATE_FORMAT(FROM_UNIXTIME(end), '%d') AS INTEGER) AS endday,
+                          CAST(DATE_FORMAT(FROM_UNIXTIME(end), '%m') AS INTEGER) AS endmonth
+                      FROM {vpc_table_name}
+                      WHERE year >= CAST(FORMAT_DATETIME(DATE_TRUNC('month', CURRENT_TIMESTAMP - INTERVAL '3' MONTH), 'YYYY') AS VARCHAR)
+                      AND year <= CAST(FORMAT_DATETIME(CURRENT_TIMESTAMP, 'YYYY') AS VARCHAR);
+                  """
+                  query_result = run_query(query, database, s3_output)
+                  if not query_result:
+                      logger.error("Failed to create or replace view")
+                      status = cfnresponse.FAILED
+              except Exception as e:
+                  logger.error(f"Exception in lambda_handler: {str(e)}")
+                  status = cfnresponse.FAILED
+              finally:
+                  cfnresponse.send(event, context, status, {})
+      Tags:
+        - Key: Name
+          Value: VPCFlowLogs-Lambda-Function
+        - Key: Purpose
+          Value: WALabVPCFlowLogs
+
+  CreateAthenaViewInitializer:
+    Type: Custom::VPCFlowLogsAthenaViewStartInitializer
+    DependsOn:
+      - VPCAthenaViewFunction
+    Properties:
+      ServiceToken: !GetAtt VPCAthenaViewFunction.Arn
+      dbName: !If [ExistingVpcLogsAthenaDataBaseCondition, !Ref VpcFlowLogsAthenaDatabaseName, vpcflowlogsathenadatabase]
+      service: vpcflowlogs
+      athenaIntegrations:
+        - s3_output: !Ref AthenaResultsOutputLocation
+          database: !If [ExistingVpcLogsAthenaDataBaseCondition, !Ref VpcFlowLogsAthenaDatabaseName, vpcflowlogsathenadatabase]
+          vpc_table_name: !If [ExistingVpcLogsAthenaTableCondition, !Ref VpcFlowLogsAthenaTableName, vpc_flow_logs_custom_integration]
+
+Outputs:
+  StackName:
+    Description: Stack name
+    Value: !Sub '${AWS::StackName}'
